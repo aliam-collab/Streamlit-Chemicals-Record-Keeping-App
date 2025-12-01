@@ -3,11 +3,9 @@ import pandas as pd
 import sqlite3
 from datetime import datetime
 from io import StringIO
-import hashlib
-import smtplib
-from email.message import EmailMessage
-import random
-import string
+import bcrypt
+import yagmail
+from email_validator import validate_email, EmailNotValidError
 
 DB_PATH = "chemicals.db"
 
@@ -21,7 +19,7 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
-    # Chemicals
+    # chemicals master list (private)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS chemicals (
         serial_no INTEGER,
@@ -33,25 +31,25 @@ def init_db():
         cas_no TEXT
     )""")
 
-    # Users
+    # users table with hashed password and email
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         username TEXT PRIMARY KEY,
         full_name TEXT,
         email TEXT,
-        password_hash TEXT,
+        password_hash BLOB,
         role TEXT
     )""")
 
-    # Password reset tokens
+    # forgot password token table
     cur.execute("""
-    CREATE TABLE IF NOT EXISTS password_resets (
-        username TEXT,
+    CREATE TABLE IF NOT EXISTS password_reset (
+        username TEXT PRIMARY KEY,
         token TEXT,
         created_at TEXT
     )""")
 
-    # Requests
+    # requests made by users
     cur.execute("""
     CREATE TABLE IF NOT EXISTS requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,7 +65,7 @@ def init_db():
         updated_at TEXT
     )""")
 
-    # Issued
+    # issued records (per user)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS issued (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,7 +77,7 @@ def init_db():
         issued_at TEXT
     )""")
 
-    # Notifications
+    # notifications for users / lab / supervisor
     cur.execute("""
     CREATE TABLE IF NOT EXISTS notifications (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,11 +91,8 @@ def init_db():
     conn.close()
 
 # -------------------------
-# Utilities
+# Utility operations
 # -------------------------
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
-
 def safe_query_df(query, params=()):
     conn = get_conn()
     df = pd.read_sql_query(query, conn, params=params)
@@ -107,8 +102,10 @@ def safe_query_df(query, params=()):
 def push_notification(recipient, message):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("INSERT INTO notifications(recipient,message,created_at) VALUES (?,?,?)",
-                (recipient, message, datetime.utcnow().isoformat()))
+    cur.execute(
+        "INSERT INTO notifications(recipient,message,created_at) VALUES (?,?,?)",
+        (recipient, message, datetime.utcnow().isoformat())
+    )
     conn.commit()
     conn.close()
 
@@ -130,19 +127,29 @@ def mark_notifications_seen(ids):
     conn.close()
 
 # -------------------------
-# Users
+# Authentication
 # -------------------------
-def signup(username, password, email, role):
+def hash_password(password):
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+
+def check_password(password, hashed):
+    return bcrypt.checkpw(password.encode(), hashed)
+
+def signup_user(username, full_name, email, password, role):
     conn = get_conn()
     cur = conn.cursor()
-    pw_hash = hash_password(password)
     try:
-        cur.execute("INSERT INTO users(username,email,password_hash,role,full_name) VALUES (?,?,?,?,?)",
-                    (username, email, pw_hash, role, username))
+        # check email validity
+        validate_email(email)
+        pw_hash = hash_password(password)
+        cur.execute("INSERT INTO users(username,full_name,email,password_hash,role) VALUES (?,?,?,?,?)",
+                    (username, full_name, email, pw_hash, role))
         conn.commit()
-        return True, "Signup successful"
+        return True, "Signup successful."
+    except EmailNotValidError:
+        return False, "Invalid email address."
     except sqlite3.IntegrityError:
-        return False, "Username already exists"
+        return False, "Username already exists."
     finally:
         conn.close()
 
@@ -152,72 +159,46 @@ def login_user(username, password):
     cur.execute("SELECT password_hash, role FROM users WHERE username=?", (username,))
     r = cur.fetchone()
     conn.close()
-    if r and hash_password(password) == r[0]:
-        return True, r[1]
-    return False, None
+    if not r:
+        return False, "User not found."
+    pw_hash, role = r
+    if check_password(password, pw_hash):
+        return True, role
+    else:
+        return False, "Incorrect password."
 
-# -------------------------
-# Forgot password
-# -------------------------
-def send_reset_email(username, token):
+def send_reset_email(username):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT email FROM users WHERE username=?", (username,))
     r = cur.fetchone()
-    if not r:
-        conn.close()
-        return False, "User not found"
-    email_address = r[0]
     conn.close()
-
-    # SMTP email setup (use your Gmail app password)
-    SMTP_EMAIL = "your_gmail@gmail.com"
-    SMTP_PASS = "your_app_password"
-
-    try:
-        msg = EmailMessage()
-        msg.set_content(f"Password reset token: {token}\nUse this in the app to reset your password.")
-        msg['Subject'] = "Chemical Record Keeper Password Reset"
-        msg['From'] = SMTP_EMAIL
-        msg['To'] = email_address
-
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
-            smtp.login(SMTP_EMAIL, SMTP_PASS)
-            smtp.send_message(msg)
-        return True, "Reset email sent"
-    except Exception as e:
-        return False, str(e)
-
-def generate_reset_token(length=6):
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
-
-def create_password_reset(username):
-    token = generate_reset_token()
+    if not r:
+        return False, "User not found."
+    email = r[0]
+    import secrets
+    token = secrets.token_urlsafe(16)
     now = datetime.utcnow().isoformat()
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("INSERT INTO password_resets(username,token,created_at) VALUES (?,?,?)", (username, token, now))
+    cur.execute("INSERT OR REPLACE INTO password_reset(username,token,created_at) VALUES (?,?,?)",
+                (username, token, now))
     conn.commit()
     conn.close()
-    return token
-
-def reset_password(username, token, new_password):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT token, created_at FROM password_resets WHERE username=? ORDER BY created_at DESC LIMIT 1", (username,))
-    r = cur.fetchone()
-    if not r or r[0] != token:
-        conn.close()
-        return False, "Invalid token"
-    # reset password
-    pw_hash = hash_password(new_password)
-    cur.execute("UPDATE users SET password_hash=? WHERE username=?", (pw_hash, username))
-    conn.commit()
-    conn.close()
-    return True, "Password reset successfully"
+    # Send email
+    # Replace with your Gmail credentials
+    GMAIL_USER = "YOUR_GMAIL@gmail.com"
+    GMAIL_PASS = "YOUR_APP_PASSWORD"
+    try:
+        yag = yagmail.SMTP(GMAIL_USER, GMAIL_PASS)
+        reset_link = f"https://yourdomain.com/reset?username={username}&token={token}"
+        yag.send(email, "Password Reset Link", f"Click here to reset your password: {reset_link}")
+        return True, "Reset link sent to email."
+    except Exception as e:
+        return False, str(e)
 
 # -------------------------
-# Chemical master list
+# Chemical operations (similar to your previous code)
 # -------------------------
 def load_chemicals():
     return safe_query_df("SELECT serial_no,chemical,amount_total,amount_remaining,issued_total,unit,cas_no FROM chemicals ORDER BY serial_no")
@@ -235,104 +216,24 @@ def upload_master_from_excel(uploaded_file):
         serial = int(r["S.NO."]) if not pd.isna(r["S.NO."]) else None
         name = str(r["Names"]).strip()
         qty = float(r["Quantity"]) if not pd.isna(r["Quantity"]) else 0.0
-        unit = str(r["Units"]).strip() if "Units" in r and not pd.isna(r["Units"]) else ""
+        unit = str(r["Units"]).strip()
         issued_total = float(r["Q.Issued"]) if not pd.isna(r["Q.Issued"]) else 0.0
         remaining = float(r["Q.Remaining"]) if not pd.isna(r["Q.Remaining"]) else qty - issued_total
-        cas = str(r["CAS.No."]).strip() if not pd.isna(r["CAS.No."]) else ""
+        cas = str(r["CAS.No."]).strip()
         cur.execute("""
             INSERT INTO chemicals(serial_no,chemical,amount_total,amount_remaining,issued_total,unit,cas_no)
             VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(chemical) DO UPDATE SET
+                serial_no=excluded.serial_no,
+                amount_total=excluded.amount_total,
+                amount_remaining=excluded.amount_remaining,
+                issued_total=excluded.issued_total,
+                unit=excluded.unit,
+                cas_no=excluded.cas_no
         """, (serial, name, qty, remaining, issued_total, unit, cas))
     conn.commit()
     conn.close()
     return True
-
-# -------------------------
-# Requests & issuance
-# -------------------------
-def create_request(username, chemical, amount, unit, note=""):
-    now = datetime.utcnow().isoformat()
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT amount_remaining, unit FROM chemicals WHERE chemical=?", (chemical,))
-    r = cur.fetchone()
-    if r:
-        remaining, chem_unit = r
-        if unit != chem_unit:
-            conn.close()
-            return False, f"Unit mismatch! Master list uses {chem_unit}."
-        if float(amount) > float(remaining):
-            conn.close()
-            return False, f"Requested amount ({amount}) exceeds remaining stock ({remaining})."
-    cur.execute("INSERT INTO requests(username,chemical,amount,unit,note,status,created_at,updated_at) VALUES (?,?,?,?,?,'Pending',?,?)",
-                (username, chemical, amount, unit, note, now, now))
-    conn.commit()
-    conn.close()
-    return True, "Request created"
-
-def list_requests(filters=None):
-    base = "SELECT id,username,chemical,amount,unit,note,status,supervisor,lab_incharge,created_at,updated_at FROM requests"
-    params = []
-    if filters:
-        clauses=[]
-        for k,v in filters.items():
-            clauses.append(f"{k}=?")
-            params.append(v)
-        base += " WHERE " + " AND ".join(clauses)
-    base += " ORDER BY created_at DESC"
-    return safe_query_df(base, params)
-
-def update_request_status(rid, status, supervisor=None, lab_incharge=None):
-    now = datetime.utcnow().isoformat()
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT status, username, chemical, amount, unit FROM requests WHERE id=?", (rid,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return False, "Request not found"
-    old_status, req_user, chem, amt, unit = row
-    if status=="Approved":
-        cur.execute("UPDATE requests SET status=?, supervisor=?, updated_at=? WHERE id=?", (status, supervisor, now, rid))
-        conn.commit()
-        conn.close()
-        push_notification(req_user, f"Your request #{rid} for {amt} {unit} {chem} was APPROVED by {supervisor}.")
-        push_notification("lab_incharge", f"Request #{rid} for {amt} {unit} {chem} by {req_user} approved by {supervisor}.")
-        return True,"Approved"
-    elif status=="Rejected":
-        cur.execute("UPDATE requests SET status=?, supervisor=?, updated_at=? WHERE id=?", (status, supervisor, now, rid))
-        conn.commit()
-        conn.close()
-        push_notification(req_user, f"Your request #{rid} for {amt} {unit} {chem} was REJECTED by {supervisor}.")
-        return True,"Rejected"
-    elif status=="Issued":
-        cur.execute("SELECT amount_remaining FROM chemicals WHERE chemical=?", (chem,))
-        remaining = cur.fetchone()[0]
-        if amt>remaining:
-            conn.close()
-            return False,f"Insufficient stock. Remaining: {remaining}"
-        cur.execute("UPDATE chemicals SET amount_remaining=amount_remaining-?, issued_total=issued_total+? WHERE chemical=?",(amt, amt, chem))
-        cur.execute("UPDATE requests SET status=?, lab_incharge=?, updated_at=? WHERE id=?",(status, lab_incharge, now, rid))
-        cur.execute("INSERT INTO issued(username,chemical,amount,unit,issued_by,issued_at) VALUES (?,?,?,?,?,?)",(req_user, chem, amt, unit, lab_incharge, now))
-        conn.commit()
-        conn.close()
-        push_notification(req_user, f"Your request #{rid} for {amt} {unit} {chem} has been ISSUED by {lab_incharge}.")
-        return True,"Issued"
-    else:
-        conn.close()
-        return False,"Unsupported status"
-
-def list_issued(filters=None):
-    base = "SELECT id,username,chemical,amount,unit,issued_by,issued_at FROM issued"
-    params=[]
-    if filters:
-        clauses=[]
-        for k,v in filters.items():
-            clauses.append(f"{k}=?")
-            params.append(v)
-        base += " WHERE " + " AND ".join(clauses)
-    base += " ORDER BY issued_at DESC"
-    return safe_query_df(base, params)
 
 # -------------------------
 # Streamlit UI
@@ -341,41 +242,65 @@ def main():
     st.set_page_config(page_title="Chemical Record Keeper", layout="wide")
     init_db()
 
-    if 'user' not in st.session_state:
-        st.session_state['user'] = None
+    st.title("Chemical Record Keeper App with Secure Login")
 
-    st.sidebar.title("Account")
-    mode = st.sidebar.radio("Mode", ["Login","Signup","Forgot Password"])
-    username = st.sidebar.text_input("Username")
-    password = st.sidebar.text_input("Password", type="password")
-    email = st.sidebar.text_input("Email (for signup/reset)")
+    menu = ["Login", "Signup", "Forgot Password"]
+    choice = st.sidebar.selectbox("Menu", menu)
 
-    if st.sidebar.button("Submit"):
-        if mode=="Signup":
-            role = st.sidebar.selectbox("Role", ["User","Supervisor","Lab"])
-            ok,msg = signup(username.strip(), password.strip(), email.strip(), role)
-            if ok: st.success(msg)
-            else: st.error(msg)
-        elif mode=="Login":
-            ok, role = login_user(username.strip(), password.strip())
+    if choice == "Signup":
+        st.subheader("Create a new account")
+        username = st.text_input("Username")
+        full_name = st.text_input("Full Name")
+        email = st.text_input("Email")
+        password = st.text_input("Password", type="password")
+        role = st.selectbox("Role", ["User", "Supervisor", "Lab"])
+        if st.button("Signup"):
+            ok, msg = signup_user(username.strip(), full_name.strip(), email.strip(), password, role)
             if ok:
-                st.session_state['user']={"username":username.strip(),"role":role}
-                st.success(f"Logged in as {username} ({role})")
+                st.success(msg)
             else:
-                st.error("Invalid credentials")
-        elif mode=="Forgot Password":
-            token = create_password_reset(username.strip())
-            ok,msg = send_reset_email(username.strip(), token)
-            if ok: st.success(msg)
-            else: st.error(msg)
+                st.error(msg)
 
-    if 'user' not in st.session_state or st.session_state['user'] is None:
-        st.info("Please login/signup to continue")
-        return
+    elif choice == "Login":
+        st.subheader("Login")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        if st.button("Login"):
+            ok, result = login_user(username.strip(), password)
+            if ok:
+                st.session_state['user'] = {"username": username.strip(), "role": result}
+                st.success(f"Logged in as {username.strip()} ({result})")
+            else:
+                st.error(result)
 
-    user = st.session_state['user']
-    st.write(f"Logged in as {user['username']} ({user['role']})")
-    # You can now add dashboards for User, Supervisor, Lab with chemical requests etc.
+    elif choice == "Forgot Password":
+        st.subheader("Forgot Password")
+        username = st.text_input("Enter your username")
+        if st.button("Send Reset Link"):
+            ok, msg = send_reset_email(username.strip())
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
 
-if __name__=="__main__":
+    # After login, show dashboard
+    if 'user' in st.session_state and st.session_state['user'] is not None:
+        user = st.session_state['user']
+        st.info(f"Logged in as {user['username']} ({user['role']})")
+
+        st.subheader("Master Chemical List")
+        chems = load_chemicals()
+        st.dataframe(chems)
+
+        st.subheader("Upload / Replace Master List (Lab Only)")
+        if user['role'] == "Lab":
+            uploaded = st.file_uploader("Upload .xlsx file", type=["xlsx"])
+            if uploaded is not None:
+                try:
+                    upload_master_from_excel(uploaded)
+                    st.success("Master list uploaded.")
+                except Exception as e:
+                    st.error(str(e))
+
+if __name__ == "__main__":
     main()
